@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"log/slog"
-	"net"
 	"testing"
 	"time"
 
@@ -43,14 +42,12 @@ func TestServeReceivesMessage(t *testing.T) {
 		t.Fatalf("tls: %v", err)
 	}
 
-	msgCh := make(chan received, 1)
+	msgCh := make(chan server.Message, 1)
 	srv, err := server.Listen(server.Config{
 		Addr:      "127.0.0.1:0",
 		TLSConfig: tlsSrv,
-		OnMessage: func(remote net.Addr, data []byte) {
-			msgCh <- received{addr: remote.String(), data: string(data)}
-		},
-		Logger: slog.New(slog.DiscardHandler),
+		OnMessage: func(m server.Message) { msgCh <- m },
+		Logger:    slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -81,11 +78,14 @@ func TestServeReceivesMessage(t *testing.T) {
 
 	select {
 	case got := <-msgCh:
-		if got.data != payload {
-			t.Fatalf("payload: got %q, want %q", got.data, payload)
+		if string(got.Data) != payload {
+			t.Fatalf("payload: got %q, want %q", got.Data, payload)
 		}
-		if got.addr == "" {
+		if got.Remote == nil || got.Remote.String() == "" {
 			t.Fatal("empty remote addr")
+		}
+		if got.StreamID != stream.StreamID() {
+			t.Fatalf("stream id: got %d, want %d", got.StreamID, stream.StreamID())
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for message")
@@ -102,7 +102,67 @@ func TestServeReceivesMessage(t *testing.T) {
 	}
 }
 
-type received struct {
-	addr string
-	data string
+// Стримы одного соединения обрабатываются независимо: сервер видит данные
+// из обоих, не дожидаясь закрытия первого.
+func TestServeHandlesConcurrentStreams(t *testing.T) {
+	t.Parallel()
+
+	tlsSrv, err := tlsconfig.NewServer(alpn.Protocol)
+	if err != nil {
+		t.Fatalf("tls: %v", err)
+	}
+
+	msgCh := make(chan server.Message, 16)
+	srv, err := server.Listen(server.Config{
+		Addr:      "127.0.0.1:0",
+		TLSConfig: tlsSrv,
+		OnMessage: func(m server.Message) { msgCh <- m },
+		Logger:    slog.New(slog.DiscardHandler),
+	})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	go func() { _ = srv.Serve(ctx) }()
+
+	tr := testutil.NewTransport(t)
+	qconn, err := tr.Dial(ctx, srv.Addr(), tlsconfig.NewInsecureClient(alpn.Protocol), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer qconn.CloseWithError(0, "done")
+
+	first, err := qconn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open first stream: %v", err)
+	}
+	second, err := qconn.OpenStreamSync(ctx)
+	if err != nil {
+		t.Fatalf("open second stream: %v", err)
+	}
+	if first.StreamID() == second.StreamID() {
+		t.Fatal("expected distinct stream IDs")
+	}
+
+	// Первый стрим намеренно не закрываем — он остаётся открытым.
+	if _, err := first.Write([]byte("from first")); err != nil {
+		t.Fatalf("write first: %v", err)
+	}
+	if _, err := second.Write([]byte("from second")); err != nil {
+		t.Fatalf("write second: %v", err)
+	}
+
+	seen := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case m := <-msgCh:
+			seen[string(m.Data)] = true
+		case <-deadline:
+			t.Fatalf("timeout, got only %v", seen)
+		}
+	}
 }

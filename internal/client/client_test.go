@@ -3,7 +3,6 @@ package client_test
 import (
 	"context"
 	"log/slog"
-	"net"
 	"testing"
 	"time"
 
@@ -26,10 +25,8 @@ func startTestServer(t *testing.T) (addr string, remotes <-chan string) {
 	srv, err := server.Listen(server.Config{
 		Addr:      "127.0.0.1:0",
 		TLSConfig: tlsSrv,
-		OnMessage: func(remote net.Addr, _ []byte) {
-			ch <- remote.String()
-		},
-		Logger: slog.New(slog.DiscardHandler),
+		OnMessage: func(m server.Message) { ch <- m.Remote.String() },
+		Logger:    slog.New(slog.DiscardHandler),
 	})
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -73,6 +70,30 @@ func TestDialAndSend(t *testing.T) {
 	}
 }
 
+func TestOpenStream(t *testing.T) {
+	t.Parallel()
+
+	addr, _ := startTestServer(t)
+	tr := testutil.NewTransport(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := client.Dial(ctx, tr, addr, tlsconfig.NewInsecureClient(alpn.Protocol), nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	extra, err := conn.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("open stream: %v", err)
+	}
+	if extra.StreamID() == conn.StreamID() {
+		t.Fatalf("expected a distinct stream, got %d twice", extra.StreamID())
+	}
+}
+
 func TestConnectionMigration(t *testing.T) {
 	t.Parallel()
 
@@ -93,33 +114,41 @@ func TestConnectionMigration(t *testing.T) {
 	if err := conn.Send([]byte("on path 1")); err != nil {
 		t.Fatalf("send path1: %v", err)
 	}
-	waitRemote(t, ctx, remotes, path1)
+	waitRemote(t, ctx, remotes, path1, nil)
 
 	if err := conn.Migrate(ctx, tr2); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
+	// Настоящее доказательство миграции — сервер видит данные с нового
+	// адреса, причём в том же самом соединении и стриме.
+	//
+	// Switch асинхронен: пакет, который event loop собирал в момент
+	// переключения, может уйти ещё по старому пути. Поэтому шлём сообщения
+	// до тех пор, пока сервер не увидит новый адрес.
 	path2 := tr2.Conn.LocalAddr().String()
-	if got := conn.LocalAddr().String(); got != path2 {
-		t.Fatalf("LocalAddr after migrate: got %s, want %s", got, path2)
-	}
-
-	if err := conn.Send([]byte("on path 2")); err != nil {
-		t.Fatalf("send path2: %v", err)
-	}
-	waitRemote(t, ctx, remotes, path2)
+	waitRemote(t, ctx, remotes, path2, func() error {
+		return conn.Send([]byte("on path 2"))
+	})
 }
 
-func waitRemote(t *testing.T, ctx context.Context, remotes <-chan string, want string) {
+// waitRemote ждёт, пока сервер не увидит сообщение с адреса want.
+// Перед каждой попыткой вызывает send (если задан).
+func waitRemote(t *testing.T, ctx context.Context, remotes <-chan string, want string, send func() error) {
 	t.Helper()
 	deadline := time.After(3 * time.Second)
 	for {
+		if send != nil {
+			if err := send(); err != nil {
+				t.Fatalf("send to %s: %v", want, err)
+			}
+		}
 		select {
 		case got := <-remotes:
 			if got == want {
 				return
 			}
-			// Пропускаем более ранние сообщения с другого пути.
+			// Сообщение ушло по старому пути — пробуем ещё раз.
 		case <-deadline:
 			t.Fatalf("timeout waiting for remote addr %s", want)
 		case <-ctx.Done():

@@ -13,8 +13,18 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+// Message — прикладная порция данных, прочитанная из стрима.
+type Message struct {
+	// Remote — текущий адрес клиента. После миграции пути он меняется сам собой.
+	Remote net.Addr
+	// StreamID позволяет отличить один логический канал от другого
+	// внутри одного и того же QUIC-соединения.
+	StreamID quic.StreamID
+	Data     []byte
+}
+
 // MessageHandler вызывается для каждого прикладного сообщения на стриме.
-type MessageHandler func(remote net.Addr, data []byte)
+type MessageHandler func(Message)
 
 // Config — параметры сервера.
 type Config struct {
@@ -98,6 +108,8 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 	s.log.Info("client connected", "remote", conn.RemoteAddr())
 	defer s.log.Info("client disconnected", "remote", conn.RemoteAddr())
 
+	// Каждый стрим обрабатывается независимо: потеря пакета в одном
+	// не задерживает чтение остальных.
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
@@ -110,14 +122,18 @@ func (s *Server) handleConn(ctx context.Context, conn *quic.Conn) {
 func (s *Server) handleStream(stream *quic.Stream, conn *quic.Conn) {
 	defer stream.Close()
 
-	buf := make([]byte, 4<<10)
+	buf := make([]byte, 64<<10)
 	for {
 		n, err := stream.Read(buf)
 		if n > 0 && s.onMessage != nil {
 			// Копируем, чтобы обработчик мог сохранить слайс.
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			s.onMessage(conn.RemoteAddr(), data)
+			s.onMessage(Message{
+				Remote:   conn.RemoteAddr(),
+				StreamID: stream.StreamID(),
+				Data:     data,
+			})
 		}
 		if err != nil {
 			if !errors.Is(err, io.EOF) {

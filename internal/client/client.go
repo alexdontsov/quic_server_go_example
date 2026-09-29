@@ -55,7 +55,7 @@ func Dial(ctx context.Context, tr *quic.Transport, serverAddr string, tlsConf *t
 	}, nil
 }
 
-// Send пишет сообщение в стрим сессии.
+// Send пишет сообщение в основной стрим сессии.
 func (c *Conn) Send(data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -64,6 +64,30 @@ func (c *Conn) Send(data []byte) error {
 	}
 	_, err := c.stream.Write(data)
 	return err
+}
+
+// OpenStream открывает дополнительный двунаправленный стрим в том же соединении.
+// Стримы независимы друг от друга: у каждого свои offset'ы и flow control.
+func (c *Conn) OpenStream(ctx context.Context) (*quic.Stream, error) {
+	c.mu.Lock()
+	qconn := c.conn
+	c.mu.Unlock()
+
+	if qconn == nil {
+		return nil, errors.New("connection closed")
+	}
+	stream, err := qconn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open stream: %w", err)
+	}
+	return stream, nil
+}
+
+// StreamID возвращает идентификатор основного стрима сессии.
+func (c *Conn) StreamID() quic.StreamID {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stream.StreamID()
 }
 
 // Migrate проверяет новый сетевой путь на next и переключает соединение на него.
@@ -81,6 +105,7 @@ func (c *Conn) Migrate(ctx context.Context, next *quic.Transport) error {
 		return errors.New("connection closed")
 	}
 
+	// Шаг 1: регистрируем новый путь. Пакеты по нему ещё не идут.
 	path, err := qconn.AddPath(next)
 	if err != nil {
 		return fmt.Errorf("add path: %w", err)
@@ -93,31 +118,35 @@ func (c *Conn) Migrate(ctx context.Context, next *quic.Transport) error {
 		defer cancel()
 	}
 
+	// Шаг 2: валидация пути через PATH_CHALLENGE / PATH_RESPONSE.
+	// Без неё Switch вернёт quic.ErrPathNotValidated.
 	if err := path.Probe(probeCtx); err != nil {
 		_ = path.Close()
 		return fmt.Errorf("probe path: %w", err)
 	}
+	// Шаг 3: переключение трафика на новый путь.
+	//
+	// Switch не применяет переключение немедленно, а ставит его в очередь:
+	// новый путь активирует event loop соединения на следующей итерации.
+	// Отсюда два следствия. Во-первых, пакет, который event loop уже
+	// собирал в момент вызова, может уйти ещё по старому пути — данные
+	// не потеряются, но «первое сообщение с нового адреса» гарантировать
+	// нельзя. Во-вторых, LocalAddr какое-то время будет отдавать старый
+	// адрес, и опрашивать его в цикле нельзя: quic-go меняет нижележащий
+	// сокет без синхронизации с LocalAddr, и race detector справедливо
+	// ругается. Актуальный адрес нового пути — next.Conn.LocalAddr().
 	if err := path.Switch(); err != nil {
 		_ = path.Close()
 		return fmt.Errorf("switch path: %w", err)
-	}
-
-	// Switch только ставит миграцию в очередь; LocalAddr обновится, когда
-	// event loop соединения применит новый путь. Ждём активного нового пути.
-	want := next.Conn.LocalAddr().String()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	for qconn.LocalAddr().String() != want {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for path switch: %w", ctx.Err())
-		case <-ticker.C:
-		}
 	}
 	return nil
 }
 
 // LocalAddr возвращает локальный адрес активного пути.
+//
+// Сразу после Migrate значение может какое-то время отставать: quic-go
+// подменяет нижележащий сокет асинхронно. Если нужен гарантированно
+// актуальный адрес, берите его у Transport, на который мигрировали.
 func (c *Conn) LocalAddr() net.Addr {
 	c.mu.Lock()
 	defer c.mu.Unlock()

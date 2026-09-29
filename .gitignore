@@ -1,0 +1,12 @@
+# IDE
+.idea/
+.vscode/
+
+# Go
+/bin/
+*.test
+*.out
+
+# qlog-трассы демо
+/qlogs/
+*.sqlog

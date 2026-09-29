@@ -11,31 +11,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 )
 
-// NewServer возвращает tls.Config с короткоживущим самоподписанным сертификатом.
-func NewServer(alpn string) (*tls.Config, error) {
-	cert, err := generateSelfSignedCert()
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{alpn},
-	}, nil
-}
-
-// NewInsecureClient возвращает клиентский tls.Config без проверки сертификата.
-// Только для локальных демо и тестов.
-func NewInsecureClient(alpn string) *tls.Config {
-	return &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{alpn},
-	}
-}
-
-func generateSelfSignedCert() (tls.Certificate, error) {
+// NewCertificate генерирует самоподписанный ECDSA-сертификат для localhost.
+// Сертификат живёт в памяти: читателю не нужно ничего готовить заранее.
+func NewCertificate() (tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("generate key: %w", err)
@@ -48,12 +30,15 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 
 	now := time.Now()
 	template := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{Organization: []string{"quic-demo"}},
-		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{Organization: []string{"quic-demo"}},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -74,4 +59,33 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		return tls.Certificate{}, fmt.Errorf("parse key pair: %w", err)
 	}
 	return tlsCert, nil
+}
+
+// NewServer возвращает серверный tls.Config со свежим самоподписанным сертификатом.
+// ALPN обязателен: QUIC откажется работать с пустым NextProtos.
+func NewServer(alpns ...string) (*tls.Config, error) {
+	cert, err := NewCertificate()
+	if err != nil {
+		return nil, err
+	}
+	return ServerWithCert(cert, alpns...), nil
+}
+
+// ServerWithCert собирает серверный tls.Config поверх готового сертификата.
+// Нужен, когда один и тот же сертификат обслуживает несколько протоколов (h3 и h2).
+func ServerWithCert(cert tls.Certificate, alpns ...string) *tls.Config {
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   alpns,
+	}
+}
+
+// NewInsecureClient возвращает клиентский tls.Config без проверки сертификата.
+// Только для локальных демо и тестов.
+func NewInsecureClient(alpns ...string) *tls.Config {
+	return &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         alpns,
+	}
 }
